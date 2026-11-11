@@ -1,0 +1,111 @@
+name: kernel-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
+            libelf-dev python3 zip unzip rsync device-tree-compiler cpio \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Baixar toolchain clang
+        run: |
+          set -e
+          curl -sSL -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-llvm-r596125-release/clang-r584948b.tar.gz"
+          mkdir -p "$HOME/tc"
+          tar -xzf /tmp/clang.tar.gz -C "$HOME/tc"
+          "$HOME/tc/bin/clang" --version | head -n 1
+
+      - name: Baixar kernel (commit 6b34d2476532)
+        run: |
+          set -e
+          curl -sSL -o /tmp/kernel.tar.gz \
+            "https://github.com/LineageOS/android_kernel_xiaomi_sm8250/archive/6b34d2476532.tar.gz"
+          mkdir -p "$HOME/kernel"
+          tar -xzf /tmp/kernel.tar.gz -C "$HOME/kernel" --strip-components=1
+
+      - name: Aplicar patch do cgroup freezer
+        run: |
+          set -e
+          cd "$HOME/kernel"
+          P="$GITHUB_WORKSPACE/patches/0001-cgroup-freezer-prevent-spurious-transition.patch"
+          patch -p1 --dry-run < "$P"
+          patch -p1 < "$P"
+          echo "--- trecho corrigido ---"
+          sed -n '128,152p' kernel/cgroup/freezer.c
+
+      - name: Configurar kernel
+        run: |
+          set -e
+          cd "$HOME/kernel"
+          export PATH="$HOME/tc/bin:$PATH"
+          export ARCH=arm64
+          make -s O=out vendor/kona-perf_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config \
+            arch/arm64/configs/vendor/debugfs.config \
+            arch/arm64/configs/vendor/xiaomi/sm8250-common.config \
+            arch/arm64/configs/vendor/xiaomi/elish.config
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          scripts/config --file out/.config -s LOCALVERSION "-perf-g6b34d2476532"
+          make -s O=out olddefconfig
+          echo "--- localversion ---"
+          grep -E "^CONFIG_LOCALVERSION" out/.config
+
+      - name: Compilar Image
+        run: |
+          set -e
+          cd "$HOME/kernel"
+          export PATH="$HOME/tc/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            Image 2>&1 | tail -n 40
+
+      - name: Verificar versao do kernel
+        run: |
+          set -e
+          cd "$HOME/kernel"
+          IMG=out/arch/arm64/boot/Image
+          ls -l "$IMG"
+          echo "--- Linux version ---"
+          strings "$IMG" | grep -m1 "^Linux version" || true
+          echo "--- vermagic ---"
+          strings "$IMG" | grep -m1 "SMP preempt" || true
+          echo "--- freezer symbols ---"
+          strings "$IMG" | grep -c "cgroup_freezer_frozen_exit" || echo "0 (removido, como esperado)"
+          VER=$(strings "$IMG" | grep -m1 "^Linux version" | awk '{print $3}')
+          echo "VER=$VER"
+          if [ "$VER" != "4.19.325-cip136-st20-perf-g6b34d2476532" ]; then
+            echo "::error::Versao inesperada: $VER"
+            exit 1
+          fi
+          cp "$IMG" "$GITHUB_WORKSPACE/Image"
+          {
+            echo "kernel version: $VER"
+            echo "commit: 6b34d2476532 + patch cgroup-freezer"
+            echo "clang: $( "$HOME/tc/bin/clang" --version | head -n1 )"
+          } > "$GITHUB_WORKSPACE/build-info.txt"
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: |
+            Image
+            build-info.txt
+          retention-days: 7

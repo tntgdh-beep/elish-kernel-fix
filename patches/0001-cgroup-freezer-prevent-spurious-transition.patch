@@ -1,0 +1,59 @@
+From: <maintainer>
+Subject: [PATCH] cgroup: freezer: prevent spurious transition into non-frozen state
+
+Backport of the upstream/LineageOS commit that fixed the "Chrome causes
+system instability" bug (LineageOS/issues#756) on other 24.0 kernels.
+
+Neither LineageOS/android_kernel_xiaomi_sm8250 (lineage-24.0) nor
+LineageOS/android_kernel_qcom_sm8250 (lineage-20) carries this fix yet:
+cgroup_leave_frozen() still contains the old
+`if (unlikely(current->frozen)) recalc_sigpending()` path.
+
+When freezing races with waking a task (vfork(), do_signal_stop()), the
+cgroup's nr_frozen_tasks counter and state can transition spuriously to
+"unfrozen" while a task is still frozen. The task then never leaves
+do_freezer_trap(), the system hangs and the hardware watchdog reboots
+the device (observed on elish as `sysrq: Kill All Tasks` in the kernel
+log right before reboot).
+
+Reference commits (LineageOS/android_kernel_qcom_sm8150, lineage-20):
+  7a05073b  UPSTREAM: cgroup: prevent spurious transition into non-frozen state
+  28586903  UPSTREAM: cgroup: get rid of cgroup_freezer_frozen_exit()
+
+Tested-on: lineage_elish (Xiaomi Pad 5 Pro), 4.19.325-cip136, kernel
+commit 6b34d2476532.
+
+---
+ kernel/cgroup/freezer.c | 19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+diff --git a/kernel/cgroup/freezer.c b/kernel/cgroup/freezer.c
+--- a/kernel/cgroup/freezer.c
++++ b/kernel/cgroup/freezer.c
+@@ -139,19 +139,13 @@
+ 		cgroup_update_frozen(cgrp);
+ 		WARN_ON_ONCE(!current->frozen);
+ 		current->frozen = false;
++	} else if (!(current->jobctl & JOBCTL_TRAP_FREEZE)) {
++		spin_lock(&current->sighand->siglock);
++		current->jobctl |= JOBCTL_TRAP_FREEZE;
++		set_thread_flag(TIF_SIGPENDING);
++		spin_unlock(&current->sighand->siglock);
+ 	}
+ 	spin_unlock_irq(&css_set_lock);
+-
+-	if (unlikely(current->frozen)) {
+-		/*
+-		 * If the task remained in the frozen state,
+-		 * make sure it won't reach userspace without
+-		 * entering the signal handling loop.
+-		 */
+-		spin_lock_irq(&current->sighand->siglock);
+-		recalc_sigpending();
+-		spin_unlock_irq(&current->sighand->siglock);
+-	}
+ }
+ 
+ /*
+-- 
+2.43.0
