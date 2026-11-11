@@ -1,0 +1,234 @@
+[SIZE=6][B][FIX] Xiaomi Pad 5 Pro (elish) — full system freeze with Chrome on LineageOS 24.0[/B][/SIZE]
+
+[B]Applies to:[/B] Xiaomi Pad 5 Pro (elish, M2105K81AC) running LineageOS 24.0
+[B]Kernel:[/B] 4.19.325-cip136-st20 (LineageOS/android_kernel_xiaomi_sm8250, commit 6b34d2476532)
+
+[SIZE=5][B]TL;DR[/B][/SIZE]
+
+The kernel LineageOS 24.0 ships for elish is missing a cgroup freezer fix that LineageOS already applied to other 4.19 devices (a52q / a72q / gta4l, issue #756). Without it, opening Chrome can freeze the whole system until the watchdog reboots the tablet.
+
+I backported the fix, built the kernel and I'm running it. The patch touches a single file and [B]does not change the kernel version string[/B], so the prebuilt vendor_dlkm modules keep loading — no loss of Wi-Fi, GPU or touch.
+
+[LIST]
+[*][B]Patch + build scripts:[/B] [URL]https://github.com/tntgdh-beep/elish-kernel-fix[/URL]
+[*][B]Prebuilt boot.img[/B] (for build 24.0-20261013-UNOFFICIAL-elish): [URL]https://github.com/tntgdh-beep/elish-kernel-fix/releases/tag/elish-24.0-20261013[/URL]
+[/LIST]
+
+[SIZE=5][B]Symptoms[/B][/SIZE]
+
+After some time using Chrome (easier to trigger with several tabs open), the tablet freezes completely: touch stops responding, audio hangs, and a few seconds later the device reboots by itself.
+
+In pstore / the last kernel log you'll find something like:
+
+[CODE]sysrq: Kill All Tasks[/CODE]
+
+Sometimes instead of a reboot you just see the UI come back with system_server restarted (soft reboot to the lockscreen).
+
+To check whether your tablet has the old crash recorded:
+
+[CODE]adb root
+adb shell grep -c "Kill All Tasks" /sys/fs/pstore/console-ramoops-0[/CODE]
+
+[SIZE=5][B]Root cause[/B][/SIZE]
+
+The 4.19 kernel uses the cgroup v2 freezer to freeze cached processes. The implementation in cgroup_leave_frozen() is outdated:
+
+[CODE]	spin_unlock_irq(&css_set_lock);
+
+	if (unlikely(current->frozen)) {
+		/*
+		 * If the task remained in the frozen state,
+		 * make sure it won't reach userspace without
+		 * entering the signal handling loop.
+		 */
+		spin_lock_irq(&current->sighand->siglock);
+		recalc_sigpending();
+		spin_unlock_irq(&current->sighand->siglock);
+	}
+[/CODE]
+
+When leaving the frozen state races with vfork() or do_signal_stop(), the cgroup's nr_frozen_tasks counter and state can spuriously go to "unfrozen" while the task is still logically frozen. That task never re-enters do_freezer_trap(), so it stays stuck forever and the system hangs until the hardware watchdog resets the device.
+
+The fix is the upstream implementation, already present in LineageOS/android_kernel_qcom_sm8150 (lineage-20, commit 7a05073b, "UPSTREAM: cgroup: prevent spurious transition into non-frozen state"), but [B]not[/B] in android_kernel_xiaomi_sm8250 (lineage-24.0) nor android_kernel_qcom_sm8250 (lineage-20).
+
+[SIZE=5][B]What the patch does[/B][/SIZE]
+
+It replaces the recalc_sigpending() block with JOBCTL_TRAP_FREEZE + TIF_SIGPENDING:
+
+[CODE]	} else if (!(current->jobctl & JOBCTL_TRAP_FREEZE)) {
+		spin_lock(&current->sighand->siglock);
+		current->jobctl |= JOBCTL_TRAP_FREEZE;
+		set_thread_flag(TIF_SIGPENDING);
+		spin_unlock(&current->sighand->siglock);
+	}
+[/CODE]
+
+This forces the task through do_freezer_trap() before it can return to userspace, so the spurious "unfrozen" transition can no longer happen.
+
+[SIZE=5][B]Requirements[/B][/SIZE]
+
+[LIST]
+[*][B]Unlocked bootloader[/B] (ro.boot.verifiedbootstate=orange). The generated boot.img has no AVB signature, which is accepted on an unlocked device — same mechanism Magisk uses.
+[*]adb + fastboot on your PC.
+[*]Root on the tablet to back up the current boot partition (adb root on LineageOS userdebug builds, or Magisk's su).
+[/LIST]
+
+[SIZE=5][B]Option 1 — Flash the prebuilt boot image (5 minutes)[/B][/SIZE]
+
+[SIZE=4][B]1.1 Check compatibility FIRST[/B][/SIZE]
+
+[CODE]adb shell getprop ro.lineage.version
+# must be: 24.0-20261013-UNOFFICIAL-elish
+
+adb shell uname -r
+# must be: 4.19.325-cip136-st20-perf-g6b34d2476532[/CODE]
+
+If your build is newer, [B]stop here[/B] and use Option 2. Flashing a kernel built from a different commit makes the vendor_dlkm modules fail to load (no Wi-Fi, no GPU, no touch).
+
+Also confirm your slot:
+
+[CODE]adb shell getprop ro.boot.slot_suffix
+# _a or _b[/CODE]
+
+The commands below use boot_a; replace with boot_b if your slot is _b.
+
+[SIZE=4][B]1.2 Back up the current boot partition (do not skip)[/B][/SIZE]
+
+[CODE]adb root            # or use "su -c" with Magisk
+adb shell dd if=/dev/block/by-name/boot_a of=/sdcard/boot_stock.img
+adb pull /sdcard/boot_stock.img[/CODE]
+
+Keep that file. It is your rollback.
+
+[SIZE=4][B]1.3 Download and verify[/B][/SIZE]
+
+Grab boot_a_patched.img from the releases page:
+
+[URL]https://github.com/tntgdh-beep/elish-kernel-fix/releases/tag/elish-24.0-20261013[/URL]
+
+[CODE]SHA256: fcdeffc333537e6317aefc9bae51c4f8e39ca02b280772c1e1c52760f6d3003e
+Size:   55078912 bytes[/CODE]
+
+[SIZE=4][B]1.4 Flash[/B][/SIZE]
+
+[CODE]adb reboot bootloader
+fastboot devices
+fastboot flash boot_a boot_a_patched.img
+fastboot reboot[/CODE]
+
+First boot takes the usual 30–60 s.
+
+[SIZE=4][B]1.5 Verify[/B][/SIZE]
+
+The kernel version string is intentionally unchanged, so check the build timestamp instead:
+
+[CODE]adb shell uname -v
+# must contain: #2 SMP PREEMPT Wed Nov 11 06:59:56 UTC 2026[/CODE]
+
+And confirm the modules all loaded:
+
+[CODE]adb shell "dmesg | grep -iE 'version magic|disagrees about version|Unknown symbol'"[/CODE]
+
+It should print nothing.
+
+[SIZE=4][B]1.6 Rollback (if anything goes wrong)[/B][/SIZE]
+
+[CODE]fastboot flash boot_a boot_stock.img[/CODE]
+
+If it bootloops and you can't reach adb: hold [B]Volume Down + Power[/B] to get into fastboot, then run the command above.
+
+[SIZE=5][B]Option 2 — Build it yourself (recommended if your build is newer)[/B][/SIZE]
+
+[SIZE=4][B]2.1 Install dependencies (Ubuntu / Debian host)[/B][/SIZE]
+
+[CODE]sudo apt install build-essential bc bison flex libssl-dev libelf-dev \
+  python3 cpio rsync device-tree-compiler clang lld llvm curl[/CODE]
+
+[SIZE=4][B]2.2 Build[/B][/SIZE]
+
+[CODE]git clone https://github.com/tntgdh-beep/elish-kernel-fix
+cd elish-kernel-fix
+./build-kernel.sh[/CODE]
+
+The script downloads the kernel at commit 6b34d2476532, applies the patch, builds Image, and [B]aborts if the resulting version is not exactly[/B] 4.19.325-cip136-st20-perf-g6b34d2476532.
+
+Output: elish-kernel/src/out/arch/arm64/boot/Image
+
+If the final link runs out of memory, lower the parallelism:
+
+[CODE]JOBS=4 ./build-kernel.sh[/CODE]
+
+[SIZE=4][B]2.3 Pack the boot image[/B][/SIZE]
+
+[CODE]adb root
+adb shell dd if=/dev/block/by-name/boot_a of=/sdcard/boot_stock.img
+adb pull /sdcard/boot_stock.img
+
+python3 repack.py --stock boot_stock.img \
+                  --image elish-kernel/src/out/arch/arm64/boot/Image \
+                  --output boot_a_patched.img[/CODE]
+
+repack.py replaces [B]only the kernel[/B] — ramdisk, os_version and os_patch_level are kept from the stock image, and it re-reads the result to make sure it's correct. Then flash it as in step 1.4.
+
+[SIZE=5][B]Option 3 — Integrate into your own LineageOS build[/B][/SIZE]
+
+[CODE]cd kernel/xiaomi/sm8250
+git am /path/to/0001-cgroup-freezer-prevent-spurious-transition.patch[/CODE]
+
+The patch is in git am format (with From:, Subject: and Signed-off-by:), so it also works with patch -p1 from the build tree.
+
+[SIZE=5][B]How to verify the fix is actually active[/B][/SIZE]
+
+uname -r will [B]not[/B] change — that's intentional, it is what keeps the prebuilt modules loadable. Two reliable checks:
+
+[LIST=1]
+[*]Kernel build timestamp: adb shell uname -v shows the build date of the patched kernel (#2 SMP PREEMPT Wed Nov 11 06:59:56 UTC 2026 for the prebuilt image).
+[*]Note: cgroup_freezer_frozen_exit still showing up in /proc/kallsyms is [B]expected[/B]. It is removed by a [I]later[/I] upstream commit (28586903), which is not part of this backport. What changes here is cgroup_leave_frozen, which no longer calls recalc_sigpending().
+[/LIST]
+
+[SIZE=5][B]Troubleshooting[/B][/SIZE]
+
+[B]Bootloop after flashing[/B] — restore the backup with fastboot flash boot_a boot_stock.img. Nothing else on the device was touched.
+
+[B]No Wi-Fi / no touch / no GPU after booting[/B] — you flashed an image built from a different kernel commit. Restore the backup and rebuild with Option 2. Check with:
+
+[CODE]adb shell "dmesg | grep -i 'version magic'"[/CODE]
+
+[B]adb root says "adbd cannot run as root in production builds"[/B] — use Magisk:
+
+[CODE]adb shell su -c "dd if=/dev/block/by-name/boot_a of=/sdcard/boot_stock.img"[/CODE]
+
+[B]The freeze still happens[/B] — this fix only addresses the cgroup freezer bug. If your log shows a native system_server crash in BPF (tombstone with bpf / BPF_PROG_RUN frames), that is a different bug and is not fixed here.
+
+[SIZE=5][B]FAQ[/B][/SIZE]
+
+[B]Does it survive a LineageOS OTA?[/B]
+No. Every OTA overwrites the boot partition. After updating, flash the image again — but only if the OTA's kernel is still commit 6b34d2476532; otherwise rebuild it.
+
+[B]Is it safe / does it break SafetyNet?[/B]
+Your bootloader is already unlocked and verifiedbootstate is already orange, so this changes nothing about the device's attestation state. The image is the stock ramdisk with a patched kernel.
+
+[B]Does it change performance or battery?[/B]
+No. It doesn't touch the scheduler, the freezer on/off logic or any tunable. It only fixes a race in the frozen → unfrozen transition.
+
+[B]Can I use it on another sm8250 device?[/B]
+Probably, but it was only tested on elish. Build it yourself with build-kernel.sh adapted to your device's defconfig — and don't flash the prebuilt image.
+
+[B]Workaround without flashing[/B]
+Disable the freezer (costs memory management performance, but stops the freezes):
+
+[CODE]adb shell device_config put activity_manager use_freezer false
+adb shell settings put global cached_apps_freezer disabled[/CODE]
+
+[SIZE=5][B]Credits[/B][/SIZE]
+
+[LIST]
+[*]Upstream fix: "cgroup: prevent spurious transition into non-frozen state"
+[*]LineageOS backport for 4.19: LineageOS/android_kernel_qcom_sm8150, commit 7a05073b
+[*]LineageOS issue #756 (same symptom on a52q / a72q / gta4l)
+[*]AOSP mkbootimg / unpack_bootimg tools
+[/LIST]
+
+[SIZE=4][B]Disclaimer[/B][/SIZE]
+
+Flashing a boot image can brick your device. You need an unlocked bootloader and you should keep a backup of the stock boot partition. Everything here is provided as-is, with no warranty. The patch is GPLv2 kernel code.
