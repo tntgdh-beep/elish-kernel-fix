@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tntgdh-beep <tntgdh-beep@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:00:00 +0000
+Subject: [PATCH] cgroup: freezer: prevent spurious transition into non-frozen
+ state
+
+Backport of the cgroup v2 freezer fix that other LineageOS 4.19 kernels
+already carry (LineageOS/android_kernel_qcom_sm8150, lineage-20, commit
+7a05073b "UPSTREAM: cgroup: prevent spurious transition into non-frozen
+state"). Neither android_kernel_xiaomi_sm8250 (lineage-24.0) nor
+android_kernel_qcom_sm8250 (lineage-20) has it at the time of writing.
+
+cgroup_leave_frozen() only decremented the frozen counter and cleared
+current->frozen, and then relied on recalc_sigpending() to push the task
+back into the signal handling loop. When leaving the frozen state races
+with vfork() or do_signal_stop(), the cgroup can spuriously transition
+to "unfrozen" while the task is still logically frozen. That task never
+re-enters do_freezer_trap(), so it is left stuck and the whole system
+hangs until the hardware watchdog reboots the device.
+
+Instead, mark the task with JOBCTL_TRAP_FREEZE and raise TIF_SIGPENDING,
+matching the upstream implementation, so the task is guaranteed to pass
+through do_freezer_trap() before it can return to userspace.
+
+Seen on elish (Xiaomi Pad 5 Pro, sm8250): opening Chrome eventually
+freezes the whole system and the device reboots on the watchdog, with
+"sysrq: Kill All Tasks" in the kernel log right before the reboot
+(LineageOS issue #756 has the same symptom on a52q/a72q/gta4l).
+
+Tested-on: elish, LineageOS 24.0-20261013-UNOFFICIAL, kernel
+4.19.325-cip136-st20 (commit 6b34d2476532).
+Signed-off-by: tntgdh-beep <tntgdh-beep@users.noreply.github.com>
+---
+ kernel/cgroup/freezer.c | 19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+diff --git a/kernel/cgroup/freezer.c b/kernel/cgroup/freezer.c
+index 3bfbb3c..c321e76 100644
+--- a/kernel/cgroup/freezer.c
++++ b/kernel/cgroup/freezer.c
+@@ -139,19 +139,13 @@ void cgroup_leave_frozen(bool always_leave)
+ 		cgroup_update_frozen(cgrp);
+ 		WARN_ON_ONCE(!current->frozen);
+ 		current->frozen = false;
++	} else if (!(current->jobctl & JOBCTL_TRAP_FREEZE)) {
++		spin_lock(&current->sighand->siglock);
++		current->jobctl |= JOBCTL_TRAP_FREEZE;
++		set_thread_flag(TIF_SIGPENDING);
++		spin_unlock(&current->sighand->siglock);
+ 	}
+ 	spin_unlock_irq(&css_set_lock);
+-
+-	if (unlikely(current->frozen)) {
+-		/*
+-		 * If the task remained in the frozen state,
+-		 * make sure it won't reach userspace without
+-		 * entering the signal handling loop.
+-		 */
+-		spin_lock_irq(&current->sighand->siglock);
+-		recalc_sigpending();
+-		spin_unlock_irq(&current->sighand->siglock);
+-	}
+ }
+ 
+ /*
+
+-- 
+2.43.0
+

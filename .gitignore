@@ -1,0 +1,6 @@
+cache/
+work/
+*.img
+*.tar.gz
+__pycache__/
+*.pyc
